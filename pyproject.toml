@@ -13,10 +13,18 @@ dependencies = [
 
 [project.optional-dependencies]
 # Remote tool execution over MCP. Optional because the runtime is perfectly usable
-# with in-process tools (LocalToolBroker) or none at all. The `agent-mcp-py` git pin
-# joins this list once that repo tags v0.1.0 — until then `mcp_client` falls back to
-# its own copies of the depth constants and its injected registry mapping.
-mcp = ["mcp>=1.2"]
+# with in-process tools (LocalToolBroker) or none at all.
+#
+# v2, not v1: the client API changed outright. `streamablehttp_client` is gone,
+# its replacement takes no `headers=` (so the depth-guard headers now travel via a
+# caller-owned httpx2 client), and Python attributes went snake_case while the wire
+# stayed camelCase. `mcp>=1.2` would resolve happily and then fail at the first
+# remote call, which is the worst possible time to find out.
+#
+# The `agent-mcp-py` git pin joins this list once that repo publishes v0.1.0 — until
+# then `mcp_client` falls back to its own signature-compatible copies of the depth
+# constants and to an injected registry mapping.
+mcp = ["mcp>=2.0,<3"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

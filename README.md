@@ -98,11 +98,42 @@ The runner talks to a `ToolBroker` — two async methods, `list_tools()` and
 | `CompositeBroker` | All of the above at once |
 
 `MCPClient` namespaces remote tools as `<server>__<tool>`, converts MCP schemas to
-the OpenAI function shape, reads `readOnlyHint` / `requiresConfirmation`
-annotations, and threads the ecosystem's depth-guard headers
-(`X-Conversation-Id`, `X-Agent-Depth`, cap 5) on every call. An unreachable server
-is logged and skipped rather than failing the turn, and a failing tool comes back
-as text the model can react to — a bad tool never crashes a turn.
+the OpenAI function shape, reads the `read_only` / `requires_confirmation` flags,
+and threads the ecosystem's depth-guard headers (`X-Conversation-Id`,
+`X-Agent-Depth`, cap 5) on every call. An unreachable server is logged and skipped
+rather than failing the turn, and a failing tool comes back as text the model can
+react to — a bad tool never crashes a turn.
+
+Remote tools need the `mcp` extra, and it is **mcp v2 or nothing**:
+`pip install "agent-runtime[mcp]"`. v2 was a breaking rewrite of the client API —
+`streamablehttp_client` is gone, its replacement takes no `headers=` (so the
+depth-guard headers now travel via a caller-owned `httpx2` client), and Python
+attributes went snake_case while the wire stayed camelCase. In-process tools need
+none of this.
+
+### Talking to `agent-mcp-py` servers
+
+`agent-mcp-py` is the other half of the contract, and the details matter because
+every mismatch between the two failed *silently*:
+
+- **Flags live in `_meta`, not annotations.** MCP has no standard confirmation
+  hint, and the SDK's `ToolAnnotations` is `extra="ignore"` — a server putting
+  `requiresConfirmation` there has it dropped before the wire. Both flags are read
+  from `_meta` under `dev.johnny.agent-mcp/`, falling back to annotations for
+  servers that aren't ours. Reading only annotations fails open: every gated tool
+  looks callable without approval.
+- **Registry records hold a bare base URL.** The fixed `/mcp` mount path (and its
+  trailing slash, which dodges a 307 the MCP client won't follow) is appended by
+  the client. Appending is idempotent, so a resolver that already includes `/mcp`
+  is fine.
+- **The depth cap is checked on the outgoing hop**, using `agent_mcp`'s own
+  `check_depth` when it is installed, so the sender refuses exactly what the
+  receiver would refuse. Checking the received depth instead would build a request
+  one hop past the cap that the server then rejects.
+
+`tests/test_interop_agent_mcp.py` runs a real `agent-mcp-py` server under uvicorn
+and drives it with a real `MCPClient` — it is skipped when either package is
+absent, and it is the only test that would have caught any of the above.
 
 ## Stop conditions
 

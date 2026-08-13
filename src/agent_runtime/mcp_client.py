@@ -32,12 +32,18 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
 # --- The depth-guard contract, borrowed from agent-mcp-py when available ---
+#
+# The fallback is not merely "some constants that look similar": it must be
+# *signature compatible* with the real thing, because the call sites below are
+# shared between both branches. An exception class whose constructor differs would
+# turn a depth refusal into a TypeError only in the branch where agent-mcp-py is
+# installed — i.e. only in production.
 try:  # pragma: no cover - exercised by whichever branch the environment provides
     from agent_mcp.depth import (  # type: ignore[import-not-found]
         HEADER_AGENT_DEPTH,
@@ -45,6 +51,7 @@ try:  # pragma: no cover - exercised by whichever branch the environment provide
         HEADER_CONVERSATION_ID,
         MAX_AGENT_DEPTH,
         DepthExceeded,
+        check_depth,
     )
 
     _DEPTH_SOURCE = "agent_mcp"
@@ -54,10 +61,49 @@ except Exception:  # noqa: BLE001 — agent-mcp-py is optional, by design
     HEADER_CONFIRMED = "X-Confirmed"
     MAX_AGENT_DEPTH = 5
 
-    class DepthExceeded(RuntimeError):
-        """Raised when a call would exceed the ecosystem's agent-hop cap."""
+    class DepthExceeded(Exception):
+        """Raised when a call would exceed the ecosystem's agent-hop cap.
+
+        Mirrors ``agent_mcp.depth.DepthExceeded`` exactly, including the base class
+        and the constructor signature.
+        """
+
+        def __init__(
+            self, depth: int, limit: int, conversation_id: str | None = None
+        ) -> None:
+            self.depth = depth
+            self.limit = limit
+            self.conversation_id = conversation_id
+            super().__init__(
+                f"agent depth {depth} exceeds the limit of {limit}"
+                + (f" (conversation {conversation_id})" if conversation_id else "")
+            )
+
+    def check_depth(
+        depth: int,
+        *,
+        limit: int = MAX_AGENT_DEPTH,
+        conversation_id: str | None = None,
+    ) -> None:
+        """Refuse a depth at or past the cap.
+
+        At-or-past, not merely past: a call arriving *at* the limit has no hops
+        left, so admitting it would let it make one more. Identical to
+        ``agent_mcp.depth.check_depth`` — the two must agree exactly or a sender
+        will build requests the receiver rejects.
+        """
+        if depth >= limit:
+            raise DepthExceeded(depth, limit, conversation_id)
 
     _DEPTH_SOURCE = "fallback"
+
+# Where every server in the ecosystem mounts MCP. Same source as the depth
+# constants, same reason: one definition, so a registry full of base URLs resolves
+# to the same endpoint on both sides.
+try:  # pragma: no cover - exercised by whichever branch the environment provides
+    from agent_mcp.registry import MCP_MOUNT_PATH  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    MCP_MOUNT_PATH = "/mcp"
 
 # Function names the OpenAI tool-calling schema will accept. Anything outside this
 # is rejected by the provider, so it is worth catching at discovery time rather than
@@ -240,15 +286,36 @@ class AnthropicRegistryBroker:
 # --------------------------------------------------------------------------- #
 
 
+def _camel_to_snake(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
 def _field(obj: Any, name: str, default: Any = None) -> Any:
-    """Read a field from either an object or a mapping.
+    """Read a field from either an object or a mapping, in either naming style.
 
     The MCP SDK returns pydantic models; tests hand in dicts. Supporting both is
     what keeps the test suite free of the SDK entirely.
+
+    The casing fallback is not cosmetic. MCP's *wire* format is camelCase
+    (``isError``, ``readOnlyHint``, ``inputSchema``) but mcp v2's Python attributes
+    are snake_case (``is_error``, ``read_only_hint``, ``input_schema``). A plain
+    ``getattr(result, "isError")`` therefore returns the default against a real SDK
+    object — which for ``isError`` means every failed remote tool is silently
+    reported to the model as a success, and for ``readOnlyHint`` means every tool
+    looks unrestricted. Both are quiet, wrong, and only happen against real
+    objects, so tests using dicts would never catch them.
     """
     if isinstance(obj, Mapping):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
+        if name in obj:
+            return obj[name]
+        alt = _camel_to_snake(name)
+        return obj.get(alt, default)
+    sentinel = object()
+    value = getattr(obj, name, sentinel)
+    if value is not sentinel:
+        return value
+    value = getattr(obj, _camel_to_snake(name), sentinel)
+    return default if value is sentinel else value
 
 
 def _result_text(result: Any) -> str:
@@ -280,21 +347,61 @@ async def _default_session_factory(base_url: str, headers: dict[str, str]):
 
     Imported lazily so the `mcp` extra is genuinely optional — a host app using only
     in-process tools never needs the SDK installed.
+
+    Written against the **mcp v2** API, which is not a cosmetic change from v1:
+    ``streamablehttp_client`` (one word) no longer exists, the replacement
+    ``streamable_http_client`` takes neither ``headers=`` nor ``timeout=``, and it
+    yields a transport rather than a ``(read, write, _)`` triple. Custom headers —
+    which is the entire depth-guard mechanism — are now set by owning the underlying
+    ``httpx2.AsyncClient`` and handing it in.
     """
     try:
-        from mcp import ClientSession  # type: ignore[import-not-found]
+        import httpx2  # type: ignore[import-not-found]
+        from mcp import Client  # type: ignore[import-not-found]
         from mcp.client.streamable_http import (  # type: ignore[import-not-found]
-            streamablehttp_client,
+            streamable_http_client,
         )
     except ImportError as exc:  # pragma: no cover - depends on the extra
         raise RuntimeError(
-            "Remote MCP tools need the 'mcp' extra: pip install 'agent-runtime[mcp]'"
+            "Remote MCP tools need the 'mcp' extra: pip install 'agent-runtime[mcp]'. "
+            "Note this package targets mcp v2 (>=2.0); the v1 client API is gone."
         ) from exc
 
-    async with streamablehttp_client(base_url, headers=headers) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield session
+    async with httpx2.AsyncClient(headers=headers) as http_client:
+        transport = streamable_http_client(base_url, http_client=http_client)
+        async with Client(transport) as client:
+            yield client
+
+
+#: Namespace `agent-mcp-py` publishes its flags under, in a tool's ``_meta``.
+AGENT_MCP_META_PREFIX = "dev.johnny.agent-mcp"
+
+
+def _tool_flags(tool: Any) -> tuple[bool, bool]:
+    """Read ``(read_only, requires_confirmation)`` off a discovered tool.
+
+    ``readOnlyHint`` is a standard MCP annotation, but **there is no standard slot
+    for a confirmation flag** — and the SDK's ``ToolAnnotations`` model is
+    ``extra="ignore"``, so a server that puts ``requiresConfirmation`` there has it
+    silently dropped before it ever reaches the wire. `agent-mcp-py` therefore
+    publishes both flags in ``_meta``, which is ``extra="allow"``.
+
+    ``_meta`` wins where present; annotations are the fallback for servers that are
+    not ours. Getting this wrong fails *open* — every tool would look safe to call
+    without approval — so it is worth the two lookups.
+    """
+    meta = _field(tool, "_meta") or _field(tool, "meta") or {}
+    annotations = _field(tool, "annotations") or {}
+
+    def flag(meta_key: str, annotation_key: str) -> bool:
+        value = _field(meta, f"{AGENT_MCP_META_PREFIX}/{meta_key}")
+        if value is None:
+            value = _field(annotations, annotation_key, False)
+        return bool(value)
+
+    return flag("readOnly", "readOnlyHint"), flag(
+        "requiresConfirmation", "requiresConfirmation"
+    )
 
 
 @dataclass
@@ -343,11 +450,14 @@ class MCPClient:
         The check is done here rather than per call so an over-deep chain fails
         before any request is paid for. Outbound calls carry ``depth + 1``: this
         client is itself one hop.
+
+        What is checked is the depth we are about to **send**, not the one we
+        received. Checking the received depth would let this client build a request
+        one hop past the cap, which every agent-mcp-py server then refuses — the
+        refusal would cost a round trip and arrive as a remote protocol error
+        instead of a local one.
         """
-        if depth + 1 > MAX_AGENT_DEPTH:
-            raise DepthExceeded(
-                f"Agent depth {depth + 1} exceeds the cap of {MAX_AGENT_DEPTH}."
-            )
+        check_depth(depth + 1, limit=MAX_AGENT_DEPTH, conversation_id=conversation_id)
         self._conversation_id = conversation_id
         self._depth = depth
         self._confirmed = confirmed
@@ -362,6 +472,29 @@ class MCPClient:
 
     # --- discovery ---------------------------------------------------------
 
+    @staticmethod
+    def _as_record(value: Any, server: str) -> dict[str, Any]:
+        """Normalise whatever a resolver handed back into a plain dict.
+
+        `agent-mcp-py` returns a typed ``PeerRecord`` dataclass (with ``as_dict()``),
+        tests and hand-rolled resolvers return mappings, and an unknown name comes
+        back as ``None``. Passing ``None`` to ``dict()`` raises "NoneType is not
+        iterable", which tells nobody anything — so unknown names get a real message.
+        """
+        if value is None:
+            raise KeyError(f"No MCP server registered as {server!r}")
+        as_dict = getattr(value, "as_dict", None)
+        if callable(as_dict):
+            return dict(as_dict())
+        if is_dataclass(value) and not isinstance(value, type):
+            return dict(asdict(value))
+        if isinstance(value, Mapping):
+            return dict(value)
+        raise TypeError(
+            f"Resolver for {server!r} returned {type(value).__name__}; expected a "
+            "mapping, a dataclass, or an object with as_dict()"
+        )
+
     def _resolve(self, server: str) -> dict[str, Any]:
         """Find a server's base URL and token.
 
@@ -370,12 +503,9 @@ class MCPClient:
         that package is optional and this is the only place that needs it.
         """
         if isinstance(self._resolver, Mapping):
-            record = self._resolver.get(server)
-            if record is None:
-                raise KeyError(f"No MCP server registered as {server!r}")
-            return dict(record)
+            return self._as_record(self._resolver.get(server), server)
         if callable(self._resolver):
-            return dict(self._resolver(server))
+            return self._as_record(self._resolver(server), server)
 
         try:
             from agent_mcp.registry import resolve as registry_resolve  # type: ignore[import-not-found]
@@ -384,16 +514,42 @@ class MCPClient:
                 f"Cannot resolve MCP server {server!r}: pass a resolver, or install "
                 "agent-mcp-py so the sync-store registry is available."
             ) from exc
-        return dict(registry_resolve(server))
+        return self._as_record(registry_resolve(server), server)
+
+    @staticmethod
+    def _endpoint(record: Mapping[str, Any], server: str) -> str:
+        """The URL to actually open a session against.
+
+        A registry record stores a *base* URL (``https://finance.johnny.dev``); the
+        MCP endpoint is that plus the ecosystem's fixed mount path. Connecting to
+        the base URL would 404. ``agent-mcp-py`` hands us a precomputed ``mcp_url``
+        when it is the resolver; otherwise the path is appended here, with the
+        trailing slash that avoids the mount's 307 redirect (which the MCP client
+        does not follow).
+        """
+        explicit = record.get("mcp_url") or record.get("url")
+        if explicit:
+            return str(explicit)
+        base = record.get("base_url")
+        if not base:
+            raise KeyError(f"Registry record for {server!r} has no base_url")
+        trimmed = str(base).rstrip("/")
+        # Idempotent: the contract says a record holds a bare base URL, but a
+        # hand-written resolver very naturally writes the endpoint it actually
+        # curled. Appending blindly would produce /mcp/mcp/ and a 404 that looks
+        # like a server problem.
+        if not trimmed.endswith(MCP_MOUNT_PATH):
+            trimmed += MCP_MOUNT_PATH
+        # The trailing slash matters: a mounted MCP app answers the bare path with a
+        # 307 that the MCP client does not follow.
+        return trimmed + "/"
 
     async def _session(self, server: str) -> Any:
         if server in self._sessions:
             return self._sessions[server]
 
         record = self._resolve(server)
-        base_url = record.get("base_url") or record.get("url")
-        if not base_url:
-            raise KeyError(f"Registry record for {server!r} has no base_url")
+        base_url = self._endpoint(record, server)
 
         headers = self._headers()
         token = record.get("token")
@@ -437,16 +593,14 @@ class MCPClient:
                     continue
                 self._owners[namespaced] = (server, original)
 
-                annotations = _field(tool, "annotations") or {}
+                read_only, requires_confirmation = _tool_flags(tool)
                 schemas.append(
                     _openai_schema(
                         namespaced,
                         _field(tool, "description", "") or "",
                         _field(tool, "inputSchema") or _field(tool, "input_schema"),
-                        read_only=bool(_field(annotations, "readOnlyHint", False)),
-                        requires_confirmation=bool(
-                            _field(annotations, "requiresConfirmation", False)
-                        ),
+                        read_only=read_only,
+                        requires_confirmation=requires_confirmation,
                     )
                 )
         return schemas

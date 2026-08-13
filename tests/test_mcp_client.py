@@ -60,10 +60,17 @@ class FakeFactory:
         return _open()
 
 
+# Registry records hold a *bare* base URL — the ecosystem's fixed /mcp mount path is
+# appended by the client, so the sync store never has to store it. agent-mcp-py's
+# PeerRecord works the same way.
 REGISTRY = {
-    "finance": {"base_url": "https://finance.test/mcp", "token": "tok-fin"},
-    "spawner": {"base_url": "https://spawner.test/mcp"},
+    "finance": {"base_url": "https://finance.test", "token": "tok-fin"},
+    "spawner": {"base_url": "https://spawner.test"},
 }
+# What _endpoint() resolves those to. The trailing slash is load-bearing: a mounted
+# MCP app answers the bare path with a 307 the client does not follow.
+FINANCE_URL = "https://finance.test/mcp/"
+SPAWNER_URL = "https://spawner.test/mcp/"
 
 FINANCE_TOOLS = [
     {
@@ -183,7 +190,7 @@ async def test_anthropic_registry_callable_is_reevaluated():
 
 
 async def test_tools_are_namespaced_by_server():
-    client, _ = _client({"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)})
+    client, _ = _client({FINANCE_URL: FakeSession(FINANCE_TOOLS)})
     try:
         names = [s["function"]["name"] for s in await client.list_tools()]
     finally:
@@ -192,7 +199,7 @@ async def test_tools_are_namespaced_by_server():
 
 
 async def test_annotations_are_carried_through():
-    client, _ = _client({"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)})
+    client, _ = _client({FINANCE_URL: FakeSession(FINANCE_TOOLS)})
     try:
         schemas = {s["function"]["name"]: s for s in await client.list_tools()}
     finally:
@@ -203,7 +210,7 @@ async def test_annotations_are_carried_through():
 
 async def test_call_tool_strips_the_namespace():
     session = FakeSession(FINANCE_TOOLS)
-    client, _ = _client({"https://finance.test/mcp": session})
+    client, _ = _client({FINANCE_URL: session})
     try:
         await client.list_tools()
         result = await client.call_tool("finance__get_budget", {"quarter": "Q3"})
@@ -214,7 +221,7 @@ async def test_call_tool_strips_the_namespace():
 
 
 async def test_depth_and_conversation_headers_are_sent():
-    client, factory = _client({"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)})
+    client, factory = _client({FINANCE_URL: FakeSession(FINANCE_TOOLS)})
     client.bind(conversation_id="conv_9", depth=1)
     try:
         await client.list_tools()
@@ -230,7 +237,7 @@ async def test_depth_and_conversation_headers_are_sent():
 
 
 async def test_confirmed_header_only_when_confirmed():
-    client, factory = _client({"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)})
+    client, factory = _client({FINANCE_URL: FakeSession(FINANCE_TOOLS)})
     client.bind(conversation_id="c", depth=0, confirmed=True)
     try:
         await client.list_tools()
@@ -240,7 +247,7 @@ async def test_confirmed_header_only_when_confirmed():
 
 
 async def test_binding_past_the_depth_cap_fails_before_any_request():
-    client, factory = _client({"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)})
+    client, factory = _client({FINANCE_URL: FakeSession(FINANCE_TOOLS)})
     with pytest.raises(DepthExceeded):
         client.bind(depth=MAX_AGENT_DEPTH)
     assert factory.opened == []
@@ -251,7 +258,7 @@ async def test_is_error_result_becomes_readable_text():
         FINANCE_TOOLS,
         results={"get_budget": {"content": [{"text": "no such quarter"}], "isError": True}},
     )
-    client, _ = _client({"https://finance.test/mcp": session})
+    client, _ = _client({FINANCE_URL: session})
     try:
         await client.list_tools()
         result = await client.call_tool("finance__get_budget", {})
@@ -262,7 +269,7 @@ async def test_is_error_result_becomes_readable_text():
 
 async def test_a_failing_tool_returns_text_rather_than_raising():
     session = FakeSession(FINANCE_TOOLS, results={"get_budget": RuntimeError("upstream 500")})
-    client, _ = _client({"https://finance.test/mcp": session})
+    client, _ = _client({FINANCE_URL: session})
     try:
         await client.list_tools()
         result = await client.call_tool("finance__get_budget", {})
@@ -274,7 +281,7 @@ async def test_a_failing_tool_returns_text_rather_than_raising():
 
 async def test_an_unreachable_server_is_skipped_not_fatal():
     client, _ = _client(
-        {"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)},
+        {FINANCE_URL: FakeSession(FINANCE_TOOLS)},
         servers=("finance", "spawner"),  # spawner has no session in the factory
     )
     try:
@@ -285,7 +292,7 @@ async def test_an_unreachable_server_is_skipped_not_fatal():
 
 
 async def test_unknown_tool_is_an_error_string():
-    client, _ = _client({"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)})
+    client, _ = _client({FINANCE_URL: FakeSession(FINANCE_TOOLS)})
     try:
         assert "not available" in await client.call_tool("nowhere__thing", {})
     finally:
@@ -294,7 +301,7 @@ async def test_unknown_tool_is_an_error_string():
 
 async def test_sessions_are_reused_across_calls():
     session = FakeSession(FINANCE_TOOLS)
-    client, factory = _client({"https://finance.test/mcp": session})
+    client, factory = _client({FINANCE_URL: session})
     try:
         await client.list_tools()
         await client.call_tool("finance__get_budget", {})
@@ -324,7 +331,7 @@ async def test_composite_merges_and_routes():
     local.register("add_task", "", {}, lambda: "added")
 
     session = FakeSession(FINANCE_TOOLS)
-    remote, _ = _client({"https://finance.test/mcp": session})
+    remote, _ = _client({FINANCE_URL: session})
 
     composite = CompositeBroker([local, remote])
     try:
@@ -352,7 +359,7 @@ async def test_composite_keeps_the_first_broker_on_a_collision():
 
 async def test_composite_binds_every_broker_that_can_be_bound():
     local = LocalToolBroker()  # no bind() at all — must not blow up
-    remote, factory = _client({"https://finance.test/mcp": FakeSession(FINANCE_TOOLS)})
+    remote, factory = _client({FINANCE_URL: FakeSession(FINANCE_TOOLS)})
 
     composite = CompositeBroker([local, remote])
     composite.bind(conversation_id="conv_1", depth=0)
@@ -362,3 +369,162 @@ async def test_composite_binds_every_broker_that_can_be_bound():
         await composite.aclose()
 
     assert factory.opened[0][1]["X-Conversation-Id"] == "conv_1"
+
+
+# --- interop with agent-mcp-py ------------------------------------------------
+#
+# Each test below pins a collision that was real: the two libraries disagreed, and
+# every one of these failures was silent — a tool that looked safe, an error that
+# looked like success, a request built one hop past what the receiver accepts.
+
+
+def test_the_depth_fallback_matches_agent_mcps_signature_exactly():
+    """The call sites are shared between both branches, so a fallback whose
+    constructor differs turns a depth refusal into a TypeError *only* where
+    agent-mcp-py is installed — i.e. only in production."""
+    import inspect
+
+    from agent_runtime.mcp_client import DepthExceeded, check_depth
+
+    exc = DepthExceeded(7, 5, "conv-1")
+    assert (exc.depth, exc.limit, exc.conversation_id) == (7, 5, "conv-1")
+    assert isinstance(exc, Exception)
+    params = list(inspect.signature(check_depth).parameters)
+    assert params[0] == "depth"
+
+
+def test_the_sender_refuses_exactly_what_the_receiver_would_refuse():
+    """bind() checks the depth it is about to SEND, not the one it received.
+    Checking the received depth builds a request one hop past the cap that every
+    agent-mcp-py server then rejects — a wasted round trip surfacing as a remote
+    protocol error."""
+    from agent_runtime.mcp_client import check_depth
+
+    for depth in range(0, MAX_AGENT_DEPTH + 2):
+        try:
+            MCPClient([]).bind(depth=depth)
+            sender_allows = True
+        except DepthExceeded:
+            sender_allows = False
+        try:
+            check_depth(depth + 1, limit=MAX_AGENT_DEPTH)
+            receiver_accepts = True
+        except DepthExceeded:
+            receiver_accepts = False
+        assert sender_allows == receiver_accepts, f"disagreement at depth {depth}"
+
+
+def test_requires_confirmation_is_read_from_meta_not_annotations():
+    """MCP has no standard confirmation flag, and the SDK's ToolAnnotations model is
+    extra="ignore" — a server putting requiresConfirmation there has it silently
+    dropped. agent-mcp-py publishes it in _meta instead. Reading only annotations
+    fails open: every gated tool looks callable without approval."""
+    from agent_runtime.mcp_client import _tool_flags
+
+    tool = {
+        "name": "create_invoice",
+        "annotations": {"readOnlyHint": False},
+        "_meta": {
+            "dev.johnny.agent-mcp/requiresConfirmation": True,
+            "dev.johnny.agent-mcp/readOnly": False,
+        },
+    }
+    assert _tool_flags(tool) == (False, True)
+
+
+def test_flags_fall_back_to_annotations_for_servers_that_are_not_ours():
+    from agent_runtime.mcp_client import _tool_flags
+
+    assert _tool_flags({"annotations": {"readOnlyHint": True}}) == (True, False)
+    assert _tool_flags({}) == (False, False)
+
+
+def test_fields_are_read_in_either_naming_style():
+    """MCP's wire format is camelCase but mcp v2's Python attributes are snake_case.
+    Reading only camelCase off a real SDK object returns the default every time."""
+    from agent_runtime.mcp_client import _field
+
+    class SnakeCaseObject:
+        is_error = True
+        input_schema = {"type": "object"}
+
+    obj = SnakeCaseObject()
+    assert _field(obj, "isError") is True
+    assert _field(obj, "inputSchema") == {"type": "object"}
+    assert _field({"is_error": True}, "isError") is True
+    assert _field({"isError": True}, "isError") is True
+    assert _field(obj, "somethingElse", "default") == "default"
+
+
+def test_a_failed_remote_tool_is_never_reported_as_success():
+    from agent_runtime.mcp_client import _result_text
+
+    class SnakeCaseResult:
+        content = [{"text": "boom"}]
+        is_error = True
+
+    assert _result_text(SnakeCaseResult()).startswith("Error:")
+
+
+def test_a_peer_record_dataclass_is_normalised():
+    """agent-mcp-py's registry returns a typed PeerRecord, not a mapping;
+    dict(record) raises 'not iterable'."""
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class FakePeerRecord:
+        name: str
+        base_url: str
+        token: str = ""
+
+        def as_dict(self):
+            return {
+                "name": self.name,
+                "base_url": self.base_url,
+                "mcp_url": self.base_url + "/mcp/",
+                "token": self.token,
+            }
+
+    record = MCPClient._as_record(FakePeerRecord("finance", "https://f", "t"), "finance")
+    assert record["base_url"] == "https://f"
+    assert record["token"] == "t"
+
+
+def test_a_plain_dataclass_without_as_dict_still_works():
+    from dataclasses import dataclass
+
+    @dataclass
+    class Bare:
+        name: str
+        base_url: str
+
+    assert MCPClient._as_record(Bare("x", "https://x"), "x")["base_url"] == "https://x"
+
+
+def test_an_unknown_peer_gives_a_real_error_not_a_nonetype_traceback():
+    with pytest.raises(KeyError, match="missing"):
+        MCPClient._as_record(None, "missing")
+
+
+def test_the_endpoint_appends_the_mount_path_to_a_bare_base_url():
+    from agent_runtime.mcp_client import MCP_MOUNT_PATH
+
+    assert MCPClient._endpoint({"base_url": "https://f"}, "f") == f"https://f{MCP_MOUNT_PATH}/"
+    assert MCPClient._endpoint({"base_url": "https://f/"}, "f") == f"https://f{MCP_MOUNT_PATH}/"
+
+
+def test_the_endpoint_does_not_double_the_mount_path():
+    """The contract says a record holds a bare base URL, but a hand-written resolver
+    naturally writes the endpoint it actually curled. /mcp/mcp/ would 404 in a way
+    that looks like a server fault."""
+    assert MCPClient._endpoint({"base_url": "https://f/mcp"}, "f") == "https://f/mcp/"
+
+
+def test_an_explicit_mcp_url_wins_over_the_base_url():
+    record = {"base_url": "https://f", "mcp_url": "https://elsewhere/custom/"}
+    assert MCPClient._endpoint(record, "f") == "https://elsewhere/custom/"
+
+
+def test_a_record_with_no_url_at_all_is_a_clear_error():
+    with pytest.raises(KeyError, match="base_url"):
+        MCPClient._endpoint({"token": "t"}, "f")
