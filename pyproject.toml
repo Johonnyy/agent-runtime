@@ -1,0 +1,34 @@
+[project]
+name = "agent-runtime"
+version = "0.1.0"
+description = "The shared agentic loop — call model, execute tools, feed results back, repeat. Streaming and cost tracking included."
+requires-python = ">=3.11"
+dependencies = [
+    # OpenRouter speaks the OpenAI wire protocol, so the standard client is all we
+    # need. Deliberately not OpenRouter's own Agent SDK (beta, TypeScript-first).
+    "openai>=1.40",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[project.optional-dependencies]
+# Remote tool execution over MCP. Optional because the runtime is perfectly usable
+# with in-process tools (LocalToolBroker) or none at all. The `agent-mcp-py` git pin
+# joins this list once that repo tags v0.1.0 — until then `mcp_client` falls back to
+# its own copies of the depth constants and its injected registry mapping.
+mcp = ["mcp>=1.2"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
