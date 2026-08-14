@@ -135,11 +135,18 @@ class AgentRunner:
         client: Any | None = None,
         tracker: CostTracker | None = None,
         settings: Settings | None = None,
+        flush_on_tool_call: bool = True,
     ) -> None:
         self.settings = settings or get_settings()
         self.model = model or self.settings.default_tier
         self.system_prompt = system_prompt
         self.max_tokens = max_tokens or self.settings.max_tokens
+        # Emit a newline when the model stops speaking to call a tool. On by
+        # default because the first consumer of this library is a voice loop and
+        # the alternative is audible dead air; it is whitespace, which a sentence
+        # splitter consumes. Pass False for a consumer that wants the model's text
+        # byte-for-byte.
+        self.flush_on_tool_call = flush_on_tool_call
 
         self._client = client
         self._tracker = tracker
@@ -286,6 +293,16 @@ class AgentRunner:
 
                 if not ordered:
                     return  # the model answered; we're done
+
+                if self.flush_on_tool_call and any(text_parts):
+                    # A flush hint for a downstream sentence splitter. When the model
+                    # speaks before calling a tool ("let me check that"), those words
+                    # are a complete spoken unit and should reach TTS *before* the
+                    # tool runs. Without this the splitter holds the last sentence
+                    # waiting for trailing whitespace that won't arrive until the
+                    # tool returns — for a web search, several seconds of dead air
+                    # followed by the preamble and the answer at once.
+                    yield "\n"
 
                 working.append(self._assistant_turn(state.steps[-1]))
                 for call in ordered:

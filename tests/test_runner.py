@@ -282,7 +282,10 @@ async def test_text_spoken_before_a_tool_call_still_streams():
         text_chunks("It's $10."),
     )
     out = await collect(runner(client, broker=FakeBroker()).stream("budget?"))
-    assert out == ["Let me check. ", "It's $10."]
+    # The "\n" is the tool-boundary flush hint, on by default since the first
+    # consumer of this library is a voice loop — see the dedicated tests below for
+    # why, and `flush_on_tool_call=False` to stream the model's text verbatim.
+    assert out == ["Let me check. ", "\n", "It's $10."]
 
 
 async def test_malformed_arguments_become_an_error_result():
@@ -465,3 +468,48 @@ async def test_model_tier_is_resolved_before_the_call():
     client = FakeClient(text_chunks("hi"))
     await collect(runner(client, model="strong").stream("hi"))
     assert client.calls[0]["model"] == TIERS["strong"]
+
+
+# --- the tool-boundary flush hint ---
+
+
+async def test_speech_before_a_tool_call_is_flushed_for_the_splitter():
+    """A voice agent's sentence splitter holds the last sentence until trailing
+    whitespace arrives. Without a hint at the tool boundary that whitespace only
+    comes after the tool returns — several seconds of dead air for a web search,
+    then the preamble and the answer at once."""
+    client = FakeClient(
+        tool_chunks("get_budget", '{"quarter": "Q3"}', text="Let me check that"),
+        text_chunks(" You have $10 left."),
+    )
+    broker = FakeBroker(results={"get_budget": "$10"})
+
+    out = await collect(runner(client, broker=broker).stream("budget?"))
+
+    assert out == ["Let me check that", "\n", " You have $10 left."]
+
+
+async def test_the_flush_hint_can_be_turned_off():
+    client = FakeClient(
+        tool_chunks("get_budget", "{}", text="Checking"),
+        text_chunks(" done."),
+    )
+    broker = FakeBroker(results={"get_budget": "$10"})
+    r = runner(client, broker=broker)
+    r.flush_on_tool_call = False
+
+    assert await collect(r.stream("budget?")) == ["Checking", " done."]
+
+
+async def test_a_silent_tool_call_emits_no_stray_newline():
+    """Nothing was spoken before the tool, so there is nothing to flush — a bare
+    newline would be a spurious empty unit for the splitter."""
+    client = FakeClient(
+        tool_chunks("get_budget", "{}"),  # no text at all
+        text_chunks("You have $10 left."),
+    )
+    broker = FakeBroker(results={"get_budget": "$10"})
+
+    assert await collect(runner(client, broker=broker).stream("budget?")) == [
+        "You have $10 left."
+    ]
