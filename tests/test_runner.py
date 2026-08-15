@@ -11,7 +11,7 @@ import pytest
 
 from agent_runtime.config import Settings
 from agent_runtime.model_router import TIERS
-from agent_runtime.runner import AgentRunner
+from agent_runtime.runner import AgentRunner, get_client
 from agent_runtime.stop_conditions import StopOnCost, StopOnSteps
 
 MODEL = TIERS["balanced"]
@@ -513,3 +513,40 @@ async def test_a_silent_tool_call_emits_no_stray_newline():
     assert await collect(runner(client, broker=broker).stream("budget?")) == [
         "You have $10 left."
     ]
+
+
+# --- client construction -----------------------------------------------------
+
+
+def test_get_client_uses_the_injected_settings_not_the_environment(monkeypatch):
+    """The host app's key has to reach the wire.
+
+    A host that configures this library by injection sets no ``AGENT_RUNTIME_*``
+    variables at all, so reading the module-level settings singleton here meant the
+    injected key was honoured everywhere except on the request itself.
+    """
+    monkeypatch.delenv("AGENT_RUNTIME_OPENROUTER_API_KEY", raising=False)
+
+    client = get_client(settings(openrouter_api_key="sk-injected", title="Amber"))
+
+    assert client.api_key == "sk-injected"
+
+
+def test_a_missing_key_fails_loudly_instead_of_becoming_a_401():
+    with pytest.raises(RuntimeError, match="No OpenRouter API key"):
+        get_client(settings(openrouter_api_key=""))
+
+
+async def test_the_runner_builds_its_client_from_its_own_settings(monkeypatch):
+    seen = {}
+    fake = FakeClient(text_chunks("hi"))
+
+    def fake_get_client(s=None):
+        seen["settings"] = s
+        return fake
+
+    monkeypatch.setattr("agent_runtime.runner.get_client", fake_get_client)
+    own = settings(openrouter_api_key="sk-injected")
+
+    assert await collect(AgentRunner(settings=own).stream("hi")) == ["hi"]
+    assert seen["settings"] is own

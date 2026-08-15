@@ -56,21 +56,52 @@ def _now() -> str:
 
 
 @lru_cache
-def get_client() -> Any:
-    """Process-wide OpenRouter client (connection pool and key configured once)."""
+def _build_client(
+    api_key: str, base_url: str, timeout: float, referer: str, title: str
+) -> Any:
+    """One client per distinct configuration, so the pool is still shared."""
     from openai import AsyncOpenAI
 
-    settings = get_settings()
     headers: dict[str, str] = {}
-    if settings.referer:
-        headers["HTTP-Referer"] = settings.referer
-    if settings.title:
-        headers["X-Title"] = settings.title
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if title:
+        headers["X-Title"] = title
     return AsyncOpenAI(
-        api_key=settings.openrouter_api_key or "missing",
-        base_url=settings.openrouter_base_url,
-        timeout=settings.request_timeout_s,
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
         default_headers=headers or None,
+    )
+
+
+def get_client(settings: Settings | None = None) -> Any:
+    """The OpenRouter client for `settings`, pooled per configuration.
+
+    Takes the settings rather than reading `get_settings()` unconditionally. This
+    library is imported *into* another app's process, and a host that configures
+    it by injection — ``AgentRunner(settings=Settings(_env_file=None, ...))``, the
+    documented pattern — never sets ``AGENT_RUNTIME_*`` in the environment. Reading
+    the module-level singleton here meant the key the host injected was used for
+    everything except the one thing that needs it: the HTTP request.
+
+    A missing key raises rather than defaulting to a placeholder. The placeholder
+    reached the provider as a real ``Authorization`` header and came back as a bare
+    401 from OpenRouter — a misconfiguration that reads like an outage.
+    """
+    settings = settings or get_settings()
+    if not settings.openrouter_api_key:
+        raise RuntimeError(
+            "No OpenRouter API key configured. Set AGENT_RUNTIME_OPENROUTER_API_KEY, "
+            "or pass the key through to AgentRunner(settings=Settings(...)) if the "
+            "host app configures this library by injection."
+        )
+    return _build_client(
+        settings.openrouter_api_key,
+        settings.openrouter_base_url,
+        settings.request_timeout_s,
+        settings.referer,
+        settings.title,
     )
 
 
@@ -386,7 +417,7 @@ class AgentRunner:
     async def _create(
         self, model_id: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> Any:
-        client = self._client or get_client()
+        client = self._client or get_client(self.settings)
         kwargs: dict[str, Any] = {
             "model": model_id,
             "messages": messages,
