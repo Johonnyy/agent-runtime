@@ -21,11 +21,13 @@ spend can be joined to the tool calls that caused it.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from agent_runtime.config import Settings, get_settings
@@ -66,6 +68,15 @@ class CostTracker:
     def __init__(self, path: str = "agent_runtime.db", app_name: str = "unknown") -> None:
         self.path = path
         self.app_name = app_name
+        # Create the directory rather than failing on it. `sqlite3.connect` reports a
+        # missing or unwritable parent as `unable to open database file`, which names
+        # neither the path nor the reason — and this connection is opened at the END
+        # of a run, so the whole run fails after every tool in it has succeeded.
+        # Every host that shares its database with this library already does this
+        # (see bloom/app/db.py); the co-tenant was the one that did not.
+        if path and path != ":memory:" and not path.startswith("file:"):
+            with contextlib.suppress(OSError):
+                Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False: the connection is reached from asyncio.to_thread
         # worker threads. Safe because every access is serialised by _lock.
         self._conn = sqlite3.connect(path, check_same_thread=False)
@@ -169,11 +180,36 @@ class CostTracker:
 
 
 @lru_cache
-def get_tracker() -> CostTracker:
-    """Process-wide tracker singleton, opened at the configured path.
+def _build_tracker(db_path: str, app_name: str) -> CostTracker:
+    """One tracker per distinct configuration, so the connection is still reused."""
+    return CostTracker(db_path, app_name=app_name)
 
-    Cached so the schema is applied once and the connection is reused. Tests that
-    want isolation construct ``CostTracker(":memory:")`` directly and inject it.
+
+def get_tracker(settings: Settings | None = None) -> CostTracker:
+    """The cost tracker for `settings`, pooled per configuration.
+
+    Takes the settings rather than reading `get_settings()` unconditionally, for the
+    same reason `runner.get_client` does — and this is the other half of that bug,
+    left behind when the client was fixed.
+
+    This library is imported *into* another app's process, and a host that configures
+    it by injection (``AgentRunner(settings=Settings(_env_file=None, ...))``, the
+    documented pattern) never sets ``AGENT_RUNTIME_*`` in its environment. Reading
+    the module-level singleton here meant ``db_path`` fell back to its default,
+    ``agent_runtime.db`` — a *relative* path — so cost rows were written next to the
+    working directory instead of into the host's database.
+
+    The two ways that showed up were both bad and neither said what was wrong:
+
+    * where the working directory was writable, spend rows landed in a stray
+      ``./agent_runtime.db`` while every other table lived in the app's real
+      database, and the join between spend and the calls that caused it silently
+      returned nothing. Bloom's own ``runtime_settings`` docstring warns about
+      exactly this, having injected the value correctly — and been ignored.
+    * where it was not writable — a container with ``WORKDIR /srv`` running as a
+      non-root user — the run completed, its tools all succeeded, and then the
+      *final* cost write raised ``OperationalError: unable to open database file``
+      and failed the whole run at the last step.
     """
-    settings: Settings = get_settings()
-    return CostTracker(settings.db_path, app_name=settings.app_name)
+    settings = settings or get_settings()
+    return _build_tracker(settings.db_path, settings.app_name)

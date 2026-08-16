@@ -550,3 +550,26 @@ async def test_the_runner_builds_its_client_from_its_own_settings(monkeypatch):
 
     assert await collect(AgentRunner(settings=own).stream("hi")) == ["hi"]
     assert seen["settings"] is own
+
+
+async def test_an_unopenable_cost_database_does_not_fail_a_completed_run(monkeypatch):
+    """The guard's own promise: bookkeeping must not fail a completed run.
+
+    `get_tracker` used to sit OUTSIDE the try, so the one line most likely to raise —
+    opening the database — was the one line the guard did not cover. A build whose
+    every tool succeeded failed at the last step with
+    `OperationalError: unable to open database file`.
+    """
+    import sqlite3
+
+    from agent_runtime import runner as runner_mod
+    from agent_runtime.stop_conditions import Step
+
+    def explode(_settings=None):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(runner_mod, "get_tracker", explode)
+    r = AgentRunner(model=MODEL, settings=Settings(_env_file=None, openrouter_api_key="k"))
+    step = Step(index=0, model=MODEL, tokens_in=1, tokens_out=1, cost_usd=0.0)
+    # Must return, not raise. The run is over; only the bookkeeping failed.
+    await r._record([step], conversation_id="c1", depth=0)

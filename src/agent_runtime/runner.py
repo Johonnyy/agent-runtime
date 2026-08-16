@@ -532,8 +532,14 @@ class AgentRunner:
     ) -> None:
         if not steps or not self.settings.feature_cost_tracking:
             return
-        tracker = self._tracker or get_tracker()
         try:
+            # Inside the try, not above it. Opening the database is the part most
+            # likely to fail — a missing directory, a path the process cannot write —
+            # and it used to sit outside this block, so the one line that raised was
+            # the one line not covered by a guard whose whole purpose is the sentence
+            # below. A completed run, every tool in it successful, failed at the last
+            # step with `OperationalError: unable to open database file`.
+            tracker = self._tracker or get_tracker(self.settings)
             await asyncio.to_thread(
                 tracker.record_many, steps, conversation_id=conversation_id, depth=depth
             )

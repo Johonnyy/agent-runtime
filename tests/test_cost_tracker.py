@@ -122,3 +122,62 @@ def test_opening_twice_is_idempotent(tmp_path):
         assert second.summary()["calls"] == 1
     finally:
         second.close()
+
+
+# --- injected settings must reach the tracker --------------------------------
+#
+# The other half of the get_client bug. This library is imported INTO another app's
+# process, and a host that configures it by injection never sets AGENT_RUNTIME_* in
+# its environment — so reading the module-level singleton here made `db_path` fall
+# back to its relative default, `agent_runtime.db`.
+#
+# Two failure shapes, neither of which said what was wrong. Where the working
+# directory was writable, cost rows landed in a stray ./agent_runtime.db while every
+# other table lived in the host's real database, and the join between spend and the
+# calls that caused it silently returned nothing. Where it was not writable — a
+# container with WORKDIR /srv running as a non-root user — every tool in the run
+# succeeded and then the final cost write raised
+# `OperationalError: unable to open database file`.
+
+
+def test_get_tracker_uses_the_injected_db_path(tmp_path):
+    from agent_runtime.config import Settings
+    from agent_runtime.cost_tracker import get_tracker
+
+    target = tmp_path / "host.db"
+    settings = Settings(_env_file=None, db_path=str(target), app_name="bloom")
+    tracker = get_tracker(settings)
+    assert tracker.path == str(target)
+    assert tracker.app_name == "bloom"
+
+
+def test_get_tracker_pools_one_connection_per_configuration(tmp_path):
+    """It was an lru_cache singleton; it must still not reopen per call."""
+    from agent_runtime.config import Settings
+    from agent_runtime.cost_tracker import get_tracker
+
+    settings = Settings(_env_file=None, db_path=str(tmp_path / "a.db"), app_name="x")
+    assert get_tracker(settings) is get_tracker(settings)
+    other = Settings(_env_file=None, db_path=str(tmp_path / "b.db"), app_name="x")
+    assert get_tracker(other) is not get_tracker(settings)
+
+
+def test_a_missing_parent_directory_is_created_not_fatal(tmp_path):
+    """`unable to open database file` names neither the path nor the reason.
+
+    Every host that shares its database with this library already creates the
+    directory; the co-tenant was the one that did not.
+    """
+    from agent_runtime.cost_tracker import CostTracker
+
+    nested = tmp_path / "does" / "not" / "exist" / "cost.db"
+    tracker = CostTracker(str(nested), app_name="bloom")
+    assert nested.parent.is_dir()
+    tracker.close() if hasattr(tracker, "close") else None
+
+
+def test_an_in_memory_database_still_works(tmp_path):
+    """`:memory:` has no parent to create, and must not be treated as a path."""
+    from agent_runtime.cost_tracker import CostTracker
+
+    assert CostTracker(":memory:", app_name="x").path == ":memory:"
