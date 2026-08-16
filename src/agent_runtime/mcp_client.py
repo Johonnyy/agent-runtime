@@ -33,6 +33,7 @@ import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
+from functools import partial
 from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -341,8 +342,25 @@ def _result_text(result: Any) -> str:
     return text
 
 
+#: How long a peer has to answer one call, in seconds.
+#:
+#: **This must be stated, not defaulted.** `httpx` defaults to five seconds, and a
+#: peer tool is not an HTTP fetch — it is another agent, which will make at least one
+#: model call before it answers. Five seconds is shorter than almost every useful
+#: remote tool: a delegated task times out, and so does anything that thinks first.
+#: The symptom is a peer that works in `list_tools` and fails on every real call,
+#: which reads like the far end being broken rather than a client default.
+#:
+#: Generous on purpose. A wall clock belongs to the *server*, which knows what it is
+#: doing and enforces its own ceiling; this one exists only so a hung connection is
+#: eventually released rather than held forever.
+DEFAULT_TIMEOUT_S = 900.0
+
+
 @asynccontextmanager
-async def _default_session_factory(base_url: str, headers: dict[str, str]):
+async def _default_session_factory(
+    base_url: str, headers: dict[str, str], timeout_s: float = DEFAULT_TIMEOUT_S
+):
     """Open a real MCP Streamable HTTP session.
 
     Imported lazily so the `mcp` extra is genuinely optional — a host app using only
@@ -354,6 +372,9 @@ async def _default_session_factory(base_url: str, headers: dict[str, str]):
     yields a transport rather than a ``(read, write, _)`` triple. Custom headers —
     which is the entire depth-guard mechanism — are now set by owning the underlying
     ``httpx2.AsyncClient`` and handing it in.
+
+    Owning that client is also what makes the timeout ours to set; see
+    :data:`DEFAULT_TIMEOUT_S` for why leaving it at the library default is wrong.
     """
     try:
         import httpx2  # type: ignore[import-not-found]
@@ -367,10 +388,27 @@ async def _default_session_factory(base_url: str, headers: dict[str, str]):
             "Note this package targets mcp v2 (>=2.0); the v1 client API is gone."
         ) from exc
 
-    async with httpx2.AsyncClient(headers=headers) as http_client:
+    # A backstop, not the deadline. `MCPClient.call_tool` wraps each call in its own
+    # `asyncio.timeout`, which is the one that fires and the one that produces a
+    # reportable error; this is deliberately longer so it never wins the race, and
+    # exists only to release a socket the SDK has stopped waiting on.
+    async with httpx2.AsyncClient(headers=headers, timeout=timeout_s + 30.0) as http_client:
         transport = streamable_http_client(base_url, http_client=http_client)
         async with Client(transport) as client:
             yield client
+
+
+def _group_detail(error: BaseException) -> str:
+    """The useful sentence inside a (possibly nested) exception group.
+
+    ``str(ExceptionGroup)`` is "unhandled errors in a TaskGroup (1 sub-exception)",
+    which tells a model nothing it can act on. The leaf is the real failure —
+    ``ReadTimeout``, ``ConnectError`` — so that is what gets reported.
+    """
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    detail = str(error).strip()
+    return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
 
 
 #: Namespace `agent-mcp-py` publishes its flags under, in a tool's ``_meta``.
@@ -425,10 +463,17 @@ class MCPClient:
         *,
         resolver: Callable[[str], dict[str, Any]] | Mapping[str, dict[str, Any]] | None = None,
         session_factory: Callable[..., Any] | None = None,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> None:
         self.servers = list(servers)
         self._resolver = resolver
-        self._session_factory = session_factory or _default_session_factory
+        # Bound into the factory here rather than passed at call time, so a caller's
+        # own `session_factory` keeps the two-argument signature it was written
+        # against — a test's fake is not obliged to know about timeouts.
+        self._session_factory = session_factory or partial(
+            _default_session_factory, timeout_s=timeout_s
+        )
+        self.timeout_s = timeout_s
         self._stack: AsyncExitStack | None = None
         self._sessions: dict[str, Any] = {}
         self._owners: dict[str, tuple[str, str]] = {}
@@ -579,6 +624,18 @@ class MCPClient:
                 listing = await session.list_tools()
             except asyncio.CancelledError:
                 raise
+            except BaseExceptionGroup as group:  # noqa: BLE001
+                # Same wrapping as `call_tool` documents: the SDK's task group turns
+                # a dead peer into a BaseExceptionGroup, which is not an Exception.
+                # Uncaught, one unreachable server takes down discovery for all of
+                # them — the opposite of the skip-and-continue this loop is for.
+                cancels, rest = group.split(asyncio.CancelledError)
+                if cancels is not None:
+                    raise cancels from None
+                logger.warning(
+                    "MCP server %s unreachable: %s", server, _group_detail(rest or group)
+                )
+                continue
             except Exception as exc:  # noqa: BLE001
                 logger.warning("MCP server %s unreachable: %s", server, exc)
                 continue
@@ -616,21 +673,62 @@ class MCPClient:
 
         server, original = owner
         try:
-            session = await self._session(server)
-            result = await session.call_tool(original, args or {})
+            # The deadline is imposed *here*, not left to the HTTP client, and that
+            # is what makes a slow peer survivable. anyio implements a transport
+            # timeout by cancelling this very task, so it arrives as a bare
+            # `CancelledError` that no amount of inspection can tell apart from a
+            # barge-in — `Task.cancelling()` is incremented by both. `asyncio.timeout`
+            # owns the cancellation it caused, calls `uncancel()` itself, and hands
+            # back a `TimeoutError`, which is unambiguous. The client below keeps a
+            # longer timeout purely as a backstop, so this one always fires first.
+            async with asyncio.timeout(self.timeout_s):
+                session = await self._session(server)
+                result = await session.call_tool(original, args or {})
             return _result_text(result)
+        except TimeoutError:
+            logger.warning("MCP tool %s timed out after %.0fs", name, self.timeout_s)
+            return (
+                f"Error running {name}: the server did not answer within "
+                f"{self.timeout_s:.0f}s."
+            )
         except asyncio.CancelledError:
             raise
+        except BaseExceptionGroup as group:  # noqa: BLE001 — see below
+            # The MCP SDK runs its transport under an anyio task group, so a
+            # transport failure — a timeout, a dropped connection — arrives wrapped.
+            # `BaseExceptionGroup` is not an `Exception`, so it walks straight past
+            # the clause below and out of the broker, killing the whole turn over one
+            # slow peer. That is exactly the outcome this method exists to prevent.
+            cancels, rest = group.split(asyncio.CancelledError)
+            if cancels is not None:
+                # An interrupt still has to unwind, even arriving in a group.
+                raise cancels from None
+            logger.exception("MCP tool %s failed", name)
+            return f"Error running {name}: {_group_detail(rest or group)}"
         except Exception as exc:  # noqa: BLE001 — a tool must not crash the turn
             logger.exception("MCP tool %s failed", name)
             return f"Error running {name}: {exc}"
 
     async def aclose(self) -> None:
-        """Close every cached session."""
+        """Close every cached session.
+
+        Teardown never raises. A session whose transport already failed — the usual
+        case, since that is why the run is ending — throws again on the way out, and
+        an exception here would replace whatever really happened with a confusing
+        one from the cleanup path. The caller is in a ``finally``; it has an outcome
+        to report and this is not it.
+        """
         stack, self._stack = self._stack, None
         self._sessions.clear()
-        if stack is not None:
+        self._owners.clear()
+        if stack is None:
+            return
+        try:
             await stack.aclose()
+        except asyncio.CancelledError:
+            raise
+        except BaseException:  # noqa: BLE001 — see the docstring
+            logger.warning("MCP session teardown failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #

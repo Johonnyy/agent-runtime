@@ -5,10 +5,10 @@ factory, and the fake sessions below return plain dicts. That is deliberate — 
 SDK is an optional extra, so the suite has to pass without it.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import pytest
-
 from agent_runtime.mcp_client import (
     MAX_AGENT_DEPTH,
     AnthropicRegistryBroker,
@@ -17,7 +17,6 @@ from agent_runtime.mcp_client import (
     LocalToolBroker,
     MCPClient,
 )
-
 
 # --- fakes -------------------------------------------------------------------
 
@@ -528,3 +527,152 @@ def test_an_explicit_mcp_url_wins_over_the_base_url():
 def test_a_record_with_no_url_at_all_is_a_clear_error():
     with pytest.raises(KeyError, match="base_url"):
         MCPClient._endpoint({"token": "t"}, "f")
+
+
+# --- slow peers, and the two ways they used to take down a turn ---------------
+#
+# A peer tool is not an HTTP fetch: it is another agent, which makes at least one
+# model call before answering. Every one of these covers a failure that looked like
+# the far end being broken and was actually the client giving up on it.
+
+
+def test_a_peer_is_given_a_real_deadline_rather_than_the_http_default():
+    """`httpx` defaults to five seconds, which is shorter than almost any real tool.
+
+    The symptom was a peer whose `list_tools` worked and whose every actual call
+    failed — a delegated task, or anything that thinks first, never fits in five
+    seconds. The number below is not sacred; being far larger than a model call is.
+    """
+    from agent_runtime.mcp_client import DEFAULT_TIMEOUT_S
+
+    assert DEFAULT_TIMEOUT_S >= 300
+    assert MCPClient(["finance"], resolver=REGISTRY).timeout_s == DEFAULT_TIMEOUT_S
+
+
+def test_the_deadline_is_bound_into_the_default_factory_not_the_call():
+    """A caller's own session factory keeps the signature it was written against."""
+    factory = FakeFactory({})
+    client = MCPClient(["finance"], resolver=REGISTRY, session_factory=factory, timeout_s=1.0)
+    # Untouched: a fake that takes (base_url, headers) is still called that way.
+    assert client._session_factory is factory
+
+
+async def test_a_tool_that_outlasts_the_deadline_is_reported_not_raised():
+    """The whole point of the timeout being ours.
+
+    anyio implements a transport timeout by cancelling *this* task, so it surfaces
+    as a bare `CancelledError` that `Task.cancelling()` cannot tell from a barge-in.
+    Owning the deadline with `asyncio.timeout` turns it into a `TimeoutError`, which
+    is unambiguous — and lets the model be told, instead of the turn dying.
+    """
+
+    class Slow:
+        async def list_tools(self):
+            return {"tools": FINANCE_TOOLS}
+
+        async def call_tool(self, name, args):
+            await asyncio.sleep(5)
+            return {"content": [{"text": "too late"}]}
+
+    client = MCPClient(
+        ["finance"],
+        resolver=REGISTRY,
+        session_factory=FakeFactory({FINANCE_URL: Slow()}),
+        timeout_s=0.05,
+    )
+    await client.list_tools()
+    result = await client.call_tool("finance__get_budget", {})
+    assert "did not answer within" in result
+    assert result.startswith("Error running finance__get_budget")
+
+
+async def test_a_real_cancellation_still_unwinds_the_turn():
+    """The other half. Swallow this one and barge-in stops working."""
+
+    class Blocking:
+        async def list_tools(self):
+            return {"tools": FINANCE_TOOLS}
+
+        async def call_tool(self, name, args):
+            await asyncio.sleep(60)
+
+    client = MCPClient(
+        ["finance"],
+        resolver=REGISTRY,
+        session_factory=FakeFactory({FINANCE_URL: Blocking()}),
+        timeout_s=60.0,
+    )
+    await client.list_tools()
+    task = asyncio.create_task(client.call_tool("finance__get_budget", {}))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_transport_failure_arriving_in_a_group_is_still_a_string():
+    """The MCP SDK runs its transport under a task group, so failures arrive wrapped.
+
+    `BaseExceptionGroup` is not an `Exception`, so it walked straight past the
+    catch-all and out of the broker — one dead peer, whole turn gone.
+    """
+
+    class Grouped:
+        async def list_tools(self):
+            return {"tools": FINANCE_TOOLS}
+
+        async def call_tool(self, name, args):
+            raise BaseExceptionGroup("unhandled errors in a TaskGroup", [OSError("boom")])
+
+    client = MCPClient(
+        ["finance"], resolver=REGISTRY, session_factory=FakeFactory({FINANCE_URL: Grouped()})
+    )
+    await client.list_tools()
+    result = await client.call_tool("finance__get_budget", {})
+    # And the leaf is what gets reported: "unhandled errors in a TaskGroup" tells a
+    # model nothing it can act on.
+    assert "OSError: boom" in result
+
+
+async def test_a_server_that_fails_discovery_in_a_group_is_skipped_not_fatal():
+    """Same wrapping, on the other method. One bad peer must not hide the good one."""
+
+    class Grouped:
+        async def list_tools(self):
+            raise BaseExceptionGroup("unhandled errors in a TaskGroup", [OSError("down")])
+
+    sessions = {FINANCE_URL: FakeSession(FINANCE_TOOLS), SPAWNER_URL: Grouped()}
+    client = MCPClient(
+        ["finance", "spawner"], resolver=REGISTRY, session_factory=FakeFactory(sessions)
+    )
+    names = [s["function"]["name"] for s in await client.list_tools()]
+    assert names == ["finance__get_budget", "finance__move_money"]
+
+
+async def test_teardown_never_replaces_the_runs_real_outcome():
+    """A session whose transport already failed throws again on the way out.
+
+    The caller is in a `finally` with an outcome to report, and this is not it.
+    """
+
+    class Exploding:
+        async def list_tools(self):
+            return {"tools": FINANCE_TOOLS}
+
+    class ExplodingFactory(FakeFactory):
+        def __call__(self, base_url, headers):
+            @asynccontextmanager
+            async def _open():
+                self.opened.append((base_url, dict(headers)))
+                try:
+                    yield Exploding()
+                finally:
+                    raise OSError("the socket was already gone")
+
+            return _open()
+
+    client = MCPClient(
+        ["finance"], resolver=REGISTRY, session_factory=ExplodingFactory({FINANCE_URL: None})
+    )
+    await client.list_tools()
+    await client.aclose()  # must not raise
