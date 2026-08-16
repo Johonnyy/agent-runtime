@@ -37,7 +37,7 @@ from agent_runtime.mcp_client import (
     ToolBroker,
 )
 from agent_runtime.model_router import TIERS, UnknownTier, estimate_cost, resolve, tier_for
-from agent_runtime.runner import AgentRunner, RunResult, get_client
+from agent_runtime.runner import AgentRunner, RunResult, RunState, get_client
 from agent_runtime.stop_conditions import (
     Step,
     StopCondition,
@@ -56,6 +56,7 @@ __version__ = "0.1.0"
 __all__ = [
     "AgentRunner",
     "RunResult",
+    "RunState",
     "Step",
     "StopCondition",
     "StopOnCost",

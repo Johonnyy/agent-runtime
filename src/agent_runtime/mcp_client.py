@@ -238,6 +238,26 @@ class LocalToolBroker:
             return f"Error running {name}: {exc}"
 
 
+def _flag(schema: dict[str, Any], key: str) -> bool:
+    """Read an agent hint from a registry schema, top-level *or* nested in ``x_agent``.
+
+    Both spellings are in the wild and neither is wrong. A registry that only ever
+    talks to this library puts the hint at the top level; one that also serves its own
+    MCP surface groups it under ``x_agent``, because that is the block this library
+    emits and therefore the shape it looks like it wants back.
+
+    Reading only the first spelling was a quiet bug rather than a stylistic quibble.
+    Amber's registry marks its query tools with ``{"x_agent": {"read_only": True}}``,
+    so every one of them — search, fetch, recall, the memory lookups — arrived here as
+    read-write. Nothing failed; the hint simply meant nothing, and a UI built on it
+    would have labelled every harmless query as a tool that changes state.
+    """
+    if schema.get(key):
+        return True
+    nested = schema.get("x_agent")
+    return bool(nested.get(key)) if isinstance(nested, dict) else False
+
+
 class AnthropicRegistryBroker:
     """Adapter for an existing Anthropic-shaped tool registry.
 
@@ -266,8 +286,8 @@ class AnthropicRegistryBroker:
                 s["name"],
                 s.get("description", ""),
                 s.get("input_schema") or s.get("parameters"),
-                read_only=bool(s.get("read_only", False)),
-                requires_confirmation=bool(s.get("requires_confirmation", False)),
+                read_only=_flag(s, "read_only"),
+                requires_confirmation=_flag(s, "requires_confirmation"),
             )
             for s in raw
         ]

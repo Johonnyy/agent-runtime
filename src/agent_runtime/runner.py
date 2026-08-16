@@ -118,7 +118,7 @@ class RunResult:
 
 
 @dataclass
-class _RunState:
+class RunState:
     """Mutable scratch shared between the generator and its `run()` wrapper."""
 
     steps: list[Step] = field(default_factory=list)
@@ -208,18 +208,33 @@ class AgentRunner:
         system: str | None = None,
         conversation_id: str | None = None,
         depth: int = 0,
+        state: RunState | None = None,
     ) -> AsyncIterator[str]:
         """Stream the answer as text deltas.
 
         A drop-in for any existing ``AsyncIterator[str]`` brain: tool round trips
         happen inside, and only spoken text comes out.
+
+        ``state`` is how a streaming caller keeps what the stream would otherwise
+        throw away. This method used to build one inline and drop it on the floor, so
+        every `Step` — the model, tokens in and out, cost, tool calls, timings — was
+        lost on every streamed run, and `record_steps` (reachable only from `run`)
+        never fired. An app built entirely on `stream` therefore recorded **no spend
+        at all**, silently, while carefully configuring where the cost database
+        should live.
+
+        Pass one in and read ``.steps`` once the generator drains. It is appended to
+        as the run proceeds, so a run that is cancelled or abandoned part-way leaves
+        a partial but valid record rather than nothing — which is the case worth
+        capturing, since an expensive run is exactly the one most likely to be
+        interrupted.
         """
         return self._iterate(
             prompt_or_messages,
             system=system,
             conversation_id=conversation_id,
             depth=depth,
-            state=_RunState(),
+            state=state if state is not None else RunState(),
         )
 
     async def run(
@@ -237,7 +252,7 @@ class AgentRunner:
         text-to-speech function here and the answer starts playing before it has
         finished generating.
         """
-        state = _RunState()
+        state = RunState()
         tokens = self._iterate(
             prompt_or_messages,
             system=system,
@@ -267,7 +282,7 @@ class AgentRunner:
         system: str | None,
         conversation_id: str | None,
         depth: int,
-        state: _RunState,
+        state: RunState,
     ) -> AsyncIterator[str]:
         working = self._build_messages(prompt_or_messages, system)
         model_id = resolve(self.model)
@@ -526,6 +541,19 @@ class AgentRunner:
         if cost is None:
             return tokens_in, tokens_out, estimate_cost(model_id, tokens_in, tokens_out)
         return tokens_in, tokens_out, float(cost)
+
+    async def record_steps(
+        self, steps: list[Step], *, conversation_id: str | None, depth: int = 0
+    ) -> None:
+        """Write a run's spend to the cost database. Never raises.
+
+        Public because `stream` cannot call it. `run` records at the end of itself,
+        but a streamed run has no "end" the runner is present for — the caller drains
+        the generator — so the caller owns this. Do it *after* the drain, off the
+        latency path, and not from inside the generator: cancellation would otherwise
+        put a thread hop on the barge-in path.
+        """
+        await self._record(steps, conversation_id=conversation_id, depth=depth)
 
     async def _record(
         self, steps: list[Step], *, conversation_id: str | None, depth: int
